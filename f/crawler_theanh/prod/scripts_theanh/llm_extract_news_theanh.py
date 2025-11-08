@@ -1,16 +1,27 @@
 import wmill
-from openai import OpenAI  # THAY ĐỔI: Import OpenAI class
+from openai import OpenAI
 from pymongo import MongoClient
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
-from typing import Dict, Optional
+from typing import Dict
 import uuid
+
+
+# Biến toàn cục để thống kê LLM requests
+LLM_REQUEST_TRACKER = {
+    "total_requests": 0,
+    "requests_by_hour": {},
+    "failed_requests": 0
+}
 
 
 client = OpenAI(
     base_url=wmill.get_variable("f/variables_theanh/open_router_url"),
     api_key=wmill.get_variable("f/variables_theanh/open_ai_key"),
 )
+
+
+
 # Xem lại nội dung prompt
 EXTRACTION_PROMPT = """
 You are a financial news extraction expert. Extract structured information from the following news article.
@@ -122,71 +133,133 @@ Return ONLY the JSON object, no additional text.
 """
 
 
-def extract_news_with_llm(
-    html_text: str, metadata: Dict, model: str = "openai/gpt-oss-20b:free"
-) -> Dict:
-    prompt = EXTRACTION_PROMPT.format(
-        article_text=html_text[:50000],  # Token limit
-        article_title=metadata.get("title", ""),
-        publication_date=metadata.get("publication_date", ""),
-    )
+def log_error(db, error_type: str, error_message: str, source: str, document_id: str = None, url: str = None, metadata: dict = None):
+    """Ghi lỗi vào collection errors"""
+    error_doc = {
+        "_id": str(uuid.uuid4()),
+        "error_type": error_type,
+        "error_message": error_message,
+        "source": source,
+        "document_id": document_id,
+        "url": url,
+        "metadata": metadata or {},
+        "timestamp": datetime.utcnow(),
+        "resolved": False
+    }
+    return db.errors.insert_one(error_doc).inserted_id
 
-    # THAY ĐỔI: Sử dụng syntax mới cho OpenAI v1.0.0+
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a financial news extraction expert. Extract structured information from articles.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        extra_headers={  # THAY ĐỔI: Dùng extra_headers
-            "HTTP-Referer": "https://windmill.pythera.ai",
-            "X-Title": "Extract with LLM By TheAnh",
-        },
-        temperature=0.1,
-        max_tokens=4096,
-        response_format={"type": "json_object"},
-    )
 
-    # THAY ĐỔI: Syntax truy cập response mới
-    extracted_data = json.loads(response.choices[0].message.content)
+def track_llm_request(success: bool = True):
+    """Theo dõi số lượng request đến LLM theo giờ"""
+    global LLM_REQUEST_TRACKER
+    current_hour = datetime.utcnow().strftime("%Y-%m-%d %H:00")
+    
+    LLM_REQUEST_TRACKER["total_requests"] += 1
+    
+    if not success:
+        LLM_REQUEST_TRACKER["failed_requests"] += 1
+    
+    if current_hour not in LLM_REQUEST_TRACKER["requests_by_hour"]:
+        LLM_REQUEST_TRACKER["requests_by_hour"][current_hour] = 0
+    LLM_REQUEST_TRACKER["requests_by_hour"][current_hour] += 1
+
+
+def get_llm_statistics(timeframe_hours: int = 1) -> Dict:
+    """Lấy thống kê LLM requests"""
+    global LLM_REQUEST_TRACKER
+    cutoff_time = (datetime.utcnow() - timedelta(hours=timeframe_hours)).strftime("%Y-%m-%d %H:00")
+    
+    recent_requests = {
+        hour: count for hour, count in LLM_REQUEST_TRACKER["requests_by_hour"].items()
+        if hour >= cutoff_time
+    }
+    
+    total_recent = sum(recent_requests.values())
+    failed_recent = LLM_REQUEST_TRACKER["failed_requests"]  # Simplified
+    
     return {
-        "extracted": extracted_data,
-        "usage": {
-            "prompt_tokens": response.usage.prompt_tokens,
-            "completion_tokens": response.usage.completion_tokens,
-            "total_tokens": response.usage.total_tokens,
-        },
-        "model": model,
+        "total_requests": LLM_REQUEST_TRACKER["total_requests"],
+        "recent_requests": total_recent,
+        "requests_by_hour": recent_requests,
+        "failed_requests": failed_recent,
+        "success_rate": (
+            (total_recent - failed_recent) / total_recent * 100
+            if total_recent > 0 else 100
+        )
     }
 
 
+def extract_news_with_llm(
+    html_text: str, metadata: Dict, model: str = "openai/gpt-oss-20b:free"
+) -> Dict:
+    try:
+        prompt = EXTRACTION_PROMPT.format(
+            article_text=html_text[:50000],
+            article_title=metadata.get("title", ""),
+            publication_date=metadata.get("publication_date", ""),
+        )
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a financial news extraction expert. Extract structured information from articles.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            extra_headers={
+                "HTTP-Referer": "https://windmill.pythera.ai",
+                "X-Title": "Extract with LLM By TheAnh",
+            },
+            temperature=0.1,
+            max_tokens=4096,
+            response_format={"type": "json_object"},
+        )
+
+        extracted_data = json.loads(response.choices[0].message.content)
+        
+        # Lấy thông tin token usage từ response
+        token_usage = {
+            "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+            "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+            "total_tokens": response.usage.total_tokens if response.usage else 0
+        }
+        
+        track_llm_request(success=True)
+        
+        return {
+            "extracted": extracted_data,
+            "usage": token_usage,
+            "model": model,
+        }
+        
+    except Exception as e:
+        track_llm_request(success=False)
+        raise e
+
+
 def main(document_id: str, max_retries: int = 3) -> dict:
-    # max_retries: int = 3 là số lần retry lại hàm này
     client = MongoClient(wmill.get_variable("u/oudev2/mongo_uri_theanh"))
     db = client.financial_news
 
-    # Lấy raw trên mongodb
     raw_doc = db.raw_documents.find_one({"_id": document_id})
     if not raw_doc:
         return {"success": False, "error": "Document not found"}
 
-    # CẬP NHẬT status to processing
     db.raw_documents.update_one(
-        {"_id": document_id}, {"$set": {"processing_status.status": "processing"}}
+        {"_id": document_id},
+        {"$set": {"processing_status.status": "processing"}}
     )
 
     try:
-        # Trích xuất with LLM
         result = extract_news_with_llm(
-            html_text=raw_doc["content"]["text"], metadata=raw_doc["metadata"]
+            html_text=raw_doc["content"]["text"],
+            metadata=raw_doc["metadata"]
         )
 
         extracted = result["extracted"]
 
-        # Tạo news_articles document
         article_doc = {
             "_id": str(uuid.uuid4()),
             "raw_document_id": document_id,
@@ -201,15 +274,13 @@ def main(document_id: str, max_retries: int = 3) -> dict:
                 "model": result["model"],
                 "extracted_at": datetime.utcnow(),
                 "confidence_score": extracted.get("confidence_score", 0.0),
-                "token_usage": result["usage"],
+                "token_usage": result["usage"],  # Đảm bảo lưu token usage
             },
             "created_at": datetime.utcnow(),
         }
 
-        # Thêm vào news_articles
         db.news_articles.insert_one(article_doc)
 
-        # Update lại raw document status
         db.raw_documents.update_one(
             {"_id": document_id},
             {
@@ -230,8 +301,18 @@ def main(document_id: str, max_retries: int = 3) -> dict:
         }
 
     except Exception as e:
-        # Handle error
         retry_count = raw_doc["processing_status"].get("retry_count", 0)
+
+        # Log error
+        error_id = log_error(
+            db,
+            error_type="llm_extraction_error",
+            error_message=str(e),
+            source="llm_extraction",
+            document_id=document_id,
+            url=raw_doc.get("source", {}).get("url"),
+            metadata={"retry_count": retry_count}
+        )
 
         if retry_count < max_retries:
             db.raw_documents.update_one(
@@ -250,8 +331,14 @@ def main(document_id: str, max_retries: int = 3) -> dict:
                     "$set": {
                         "processing_status.status": "failed",
                         "processing_status.error_message": str(e),
+                        "processing_status.error_id": error_id,
                     }
                 },
             )
 
-        return {"success": False, "error": str(e), "retry_count": retry_count}
+        return {
+            "success": False, 
+            "error": str(e), 
+            "retry_count": retry_count,
+            "error_id": error_id
+        }

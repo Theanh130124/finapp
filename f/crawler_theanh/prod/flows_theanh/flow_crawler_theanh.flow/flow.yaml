@@ -27,20 +27,16 @@ value:
                   expr: flow_input.iter.value
               is_trigger: false
               path: f/scripts_theanh/fetch_html_theanh
-          - id: extract_with_llm
-            summary: Extract structured data using LLM
+          - id: batch_extract_llm
+            summary: Batch_extract_llm
             value:
               type: script
               input_transforms:
-                document_id:
-                  type: javascript
-                  value: ''
-                  expr: results.fetch_html.document_id
-                max_retries:
+                batch_size:
                   type: static
-                  value: 3
+                  value: 12
               is_trigger: false
-              path: f/scripts_theanh/llm_extract_news_theanh
+              path: f/scripts_theanh/_batch_extract_news_with_llm
         iterator:
           type: javascript
           expr: results.check_rss_feeds.new_articles

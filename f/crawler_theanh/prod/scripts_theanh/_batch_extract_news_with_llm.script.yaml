@@ -1,0 +1,17 @@
+summary: ' batch_extract_news_with_llm'
+description: ''
+lock: '!inline f/scripts_theanh/_batch_extract_news_with_llm.script.lock'
+kind: script
+schema:
+  $schema: 'https://json-schema.org/draft/2020-12/schema'
+  type: object
+  properties:
+    batch_size:
+      type: integer
+      description: ''
+      default: 12
+    max_retries:
+      type: integer
+      description: ''
+      default: 3
+  required: []
